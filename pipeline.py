@@ -160,7 +160,8 @@ Examples:
             "--config", str(config_path),
             "--limit", str(args.eval_limit),
             "--maj",
-            "--stats"
+            "--stats",
+            "--prefer-best"
         ]
 
         # Add --prefer-best flag if specified

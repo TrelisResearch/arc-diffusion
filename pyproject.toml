@@ -9,7 +9,8 @@ dependencies = [
     "tqdm>=4.65.0",
     "matplotlib>=3.7.0",
     "huggingface-hub>=0.20.0",
-    "wandb"
+    "wandb",
+    "hf_transfer"
 ]
 
 [project.optional-dependencies]

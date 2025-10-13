@@ -1,40 +1,5 @@
 # Diffusion Notes
 
-**Notes on Schedulers**
-- What type of noise is being used?
-v1 uses a uniform noise kernel. Tokens are replaced at random with uniformly sampled values across 0-9.
-
-- What type of scheduler is being used in our v1 model? How does that compare to image and text diffusion models?
-Possibly linear was used originally but is too aggressive early on and not aggressive enough at the end.
-
-- What is the implication of using fewer steps?
-Faster inference, and larger denoising steps.
-
-- What are some possible improvements that could be made to the noise schedule?
-We were embedding timestamps, but it's probably more fundamental to embed noise levels instead.
-
-**Clarifying Questions**
-- Alpha and beta
-Beta is the chance a cell gets repainted at step t. Alpha is the chance a cell stays the same! alpha_bar is the chance a cell survives without any change from start to finish.
-
-- What is the interpretation of cross entropy? Would it be useful to also plot some kind of pixel accuracy metric? If so what and how?
-Yes we plot by noise bucket and also total. And we now record accuracy as well in wandb.
-
-- During training and forward passing on one batch, will each datapoint in a batch get a different randomly sampled timestamp? Are timestamps sampled uniformly?
-Yes! and uniform should be fine.
-
-- How many timesteps to use?
-It's a bit unclear, empirically people seem to use 64-1000. Perhaps lower vocab leads to lower required steps for training. WE USE 128.
-
-- How many epochs or gradient updates to use?
-The logic seems to be, bigger model, more gradient updates, U. And you adjust learning rate linearly with batch size, as a larger batch size smooths gradient updates. The rough numbers seem to be: 10k updates for 100M params, 100k updates for 1B params. Perhaps for a 2M param model, use 3k updates, for 20M use 7k updates. ACTUALLY WE JUST USE 96K EVERYWHERE FOR NOW.
-
-- What noise distribution should I use? Uniform? OR matching typical arc tasks?
-Uniform is more robust and simpler.
-
-- During inference, what normally happens? We start with a noised input and denoise repeatedly? We don't add any intermediate noise do we?
-Correct!
-
 ## Daily Notes
 ### Oct 13th 2025
 Running a smol ~10M model for 250k steps, with noise addition to input grids:
@@ -43,10 +8,11 @@ nohup bash -c 'PYTHONUNBUFFERED=1 uv run pipeline.py --config configs/smol_confi
 ```
 
 ### Oct 12th 2025
-Running a smol ~10M model for 250k steps:
+Running a smol ~10M model for 250k steps on arc agi 1:
 ```bash
 nohup bash -c 'PYTHONUNBUFFERED=1 uv run pipeline.py --config configs/smol_config_aa1.json > smol-v7-aa1-250k.log 2>&1' &
 ```
+Scores up to ~17.5% with 2x attempts.
 
 ### Oct 9th 2025
 #### Kicking off a long run

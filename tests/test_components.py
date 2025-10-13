@@ -86,6 +86,9 @@ def test_model_forward():
     """Test model forward pass."""
     print("Testing model forward pass...")
 
+    # Create noise scheduler for model initialization
+    noise_scheduler = DiscreteNoiseScheduler(num_timesteps=8, vocab_size=11)
+
     # Small model for testing
     model = ARCDiffusionModel(
         vocab_size=11,
@@ -94,7 +97,8 @@ def test_model_forward():
         num_layers=2,
         max_size=10,
         max_tasks=10,
-        embedding_dropout=0.0  # Disable dropout for testing
+        embedding_dropout=0.0,  # Disable dropout for testing
+        noise_scheduler=noise_scheduler
     )
 
     batch_size = 2
@@ -106,8 +110,12 @@ def test_model_forward():
     task_ids = torch.tensor([0, 1])
     timesteps = torch.tensor([1, 2])
 
+    # Compute logsnr from timesteps
+    alpha_bars = noise_scheduler.alpha_bars[timesteps].clamp(1e-6, 1-1e-6)
+    logsnr = torch.log(alpha_bars) - torch.log1p(-alpha_bars)
+
     # Forward pass
-    logits = model(xt, input_grid, task_ids, timesteps)
+    logits = model(xt, input_grid, task_ids, logsnr)
 
     # Check shapes (model outputs 10 classes for colors 0-9)
     assert logits.shape == (batch_size, max_size, max_size, 10)
@@ -119,6 +127,9 @@ def test_loss_computation():
     """Test loss computation."""
     print("Testing loss computation...")
 
+    # Create noise scheduler for model initialization
+    noise_scheduler = DiscreteNoiseScheduler(num_timesteps=8, vocab_size=11)
+
     model = ARCDiffusionModel(
         vocab_size=11,
         d_model=64,
@@ -126,7 +137,8 @@ def test_loss_computation():
         num_layers=2,
         max_size=10,
         max_tasks=10,
-        embedding_dropout=0.0  # Disable dropout for testing
+        embedding_dropout=0.0,  # Disable dropout for testing
+        noise_scheduler=noise_scheduler
     )
 
     batch_size = 2
@@ -141,8 +153,12 @@ def test_loss_computation():
     xt = torch.randint(0, 10, (batch_size, max_size, max_size))
     timesteps = torch.tensor([1, 2])
 
+    # Compute logsnr from timesteps
+    alpha_bars = noise_scheduler.alpha_bars[timesteps].clamp(1e-6, 1-1e-6)
+    logsnr = torch.log(alpha_bars) - torch.log1p(-alpha_bars)
+
     # Compute losses
-    losses = model.compute_loss(x0, input_grid, task_ids, xt, timesteps)
+    losses = model.compute_loss(x0, input_grid, task_ids, xt, logsnr, heights=heights, widths=widths)
 
     # Check that we get expected loss components
     assert 'total_loss' in losses
@@ -156,6 +172,9 @@ def test_color_prediction():
     """Test that model can predict colors 0-9."""
     print("Testing color prediction...")
 
+    # Create noise scheduler for model initialization
+    noise_scheduler = DiscreteNoiseScheduler(num_timesteps=8, vocab_size=11)
+
     model = ARCDiffusionModel(
         vocab_size=11,
         d_model=64,
@@ -163,7 +182,8 @@ def test_color_prediction():
         num_layers=2,
         max_size=10,
         max_tasks=10,
-        embedding_dropout=0.0  # Disable dropout for testing
+        embedding_dropout=0.0,  # Disable dropout for testing
+        noise_scheduler=noise_scheduler
     )
 
     batch_size = 2
@@ -175,8 +195,12 @@ def test_color_prediction():
     task_ids = torch.tensor([0, 1])
     timesteps = torch.tensor([1, 2])
 
+    # Compute logsnr from timesteps
+    alpha_bars = noise_scheduler.alpha_bars[timesteps].clamp(1e-6, 1-1e-6)
+    logsnr = torch.log(alpha_bars) - torch.log1p(-alpha_bars)
+
     # Forward pass
-    logits = model(xt, input_grid, task_ids, timesteps)
+    logits = model(xt, input_grid, task_ids, logsnr)
 
     # Check that model predicts 10 color classes (0-9), not PAD
     assert logits.shape == (batch_size, max_size, max_size, 10)
@@ -186,6 +210,175 @@ def test_color_prediction():
     assert predictions.min() >= 0 and predictions.max() <= 9
 
     print("✓ Color prediction test passed")
+
+
+def test_self_conditioning():
+    """Test self-conditioning mechanism."""
+    print("Testing self-conditioning...")
+
+    noise_scheduler = DiscreteNoiseScheduler(num_timesteps=8, vocab_size=11)
+    model = ARCDiffusionModel(
+        vocab_size=11,
+        d_model=64,
+        nhead=2,
+        num_layers=2,
+        max_size=10,
+        max_tasks=10,
+        embedding_dropout=0.0,
+        noise_scheduler=noise_scheduler
+    )
+
+    batch_size = 2
+    max_size = 10
+
+    xt = torch.randint(0, 10, (batch_size, max_size, max_size))
+    input_grid = torch.randint(0, 11, (batch_size, max_size, max_size))
+    task_ids = torch.tensor([0, 1])
+    timesteps = torch.tensor([1, 2])
+
+    alpha_bars = noise_scheduler.alpha_bars[timesteps].clamp(1e-6, 1-1e-6)
+    logsnr = torch.log(alpha_bars) - torch.log1p(-alpha_bars)
+
+    # Test without self-conditioning
+    logits_no_sc = model(xt, input_grid, task_ids, logsnr)
+
+    # Test with self-conditioning
+    sc_p0 = torch.randn(batch_size, max_size, max_size, 10)  # Random SC input
+    sc_gain = torch.tensor([1.0, 1.0])
+    logits_with_sc = model(xt, input_grid, task_ids, logsnr, sc_p0=sc_p0, sc_gain=sc_gain)
+
+    # Both should produce valid logits
+    assert logits_no_sc.shape == (batch_size, max_size, max_size, 10)
+    assert logits_with_sc.shape == (batch_size, max_size, max_size, 10)
+
+    # Logits should be different with SC
+    assert not torch.allclose(logits_no_sc, logits_with_sc, atol=1e-4)
+
+    print("✓ Self-conditioning test passed")
+
+
+def test_augmentation():
+    """Test D4 and color shift augmentation."""
+    print("Testing augmentation...")
+
+    noise_scheduler = DiscreteNoiseScheduler(num_timesteps=8, vocab_size=11)
+    model = ARCDiffusionModel(
+        vocab_size=11,
+        d_model=64,
+        nhead=2,
+        num_layers=2,
+        max_size=10,
+        max_tasks=10,
+        embedding_dropout=0.0,
+        noise_scheduler=noise_scheduler
+    )
+
+    batch_size = 2
+    max_size = 10
+
+    xt = torch.randint(0, 10, (batch_size, max_size, max_size))
+    input_grid = torch.randint(0, 11, (batch_size, max_size, max_size))
+    task_ids = torch.tensor([0, 1])
+    timesteps = torch.tensor([1, 2])
+
+    alpha_bars = noise_scheduler.alpha_bars[timesteps].clamp(1e-6, 1-1e-6)
+    logsnr = torch.log(alpha_bars) - torch.log1p(-alpha_bars)
+
+    # Test with augmentation
+    d4_idx = torch.tensor([0, 3])  # Identity and rotation
+    color_shift = torch.tensor([0, 2])  # No shift and shift by 2
+
+    logits = model(xt, input_grid, task_ids, logsnr, d4_idx=d4_idx, color_shift=color_shift)
+    assert logits.shape == (batch_size, max_size, max_size, 10)
+
+    print("✓ Augmentation test passed")
+
+
+def test_masking():
+    """Test masking for variable-size grids."""
+    print("Testing masking...")
+
+    noise_scheduler = DiscreteNoiseScheduler(num_timesteps=8, vocab_size=11)
+    model = ARCDiffusionModel(
+        vocab_size=11,
+        d_model=64,
+        nhead=2,
+        num_layers=2,
+        max_size=10,
+        max_tasks=10,
+        embedding_dropout=0.0,
+        noise_scheduler=noise_scheduler
+    )
+
+    batch_size = 2
+    max_size = 10
+
+    xt = torch.randint(0, 10, (batch_size, max_size, max_size))
+    input_grid = torch.randint(0, 11, (batch_size, max_size, max_size))
+    task_ids = torch.tensor([0, 1])
+    timesteps = torch.tensor([1, 2])
+
+    alpha_bars = noise_scheduler.alpha_bars[timesteps].clamp(1e-6, 1-1e-6)
+    logsnr = torch.log(alpha_bars) - torch.log1p(-alpha_bars)
+
+    # Create masks
+    from utils.grid_utils import batch_create_masks
+    heights = torch.tensor([5, 7])
+    widths = torch.tensor([6, 8])
+    masks = batch_create_masks(heights, widths, max_size)
+
+    # Forward with masks
+    logits = model(xt, input_grid, task_ids, logsnr, masks=masks)
+    assert logits.shape == (batch_size, max_size, max_size, 10)
+
+    print("✓ Masking test passed")
+
+
+def test_pixel_noise():
+    """Test pixel noise augmentation."""
+    print("Testing pixel noise...")
+
+    from src.training import ARCDiffusionTrainer
+
+    noise_scheduler = DiscreteNoiseScheduler(num_timesteps=8, vocab_size=11)
+    model = ARCDiffusionModel(
+        vocab_size=11,
+        d_model=64,
+        nhead=2,
+        num_layers=2,
+        max_size=10,
+        max_tasks=10,
+        embedding_dropout=0.0,
+        noise_scheduler=noise_scheduler
+    )
+
+    # Create trainer with pixel noise enabled
+    trainer = ARCDiffusionTrainer(
+        model=model,
+        noise_scheduler=noise_scheduler,
+        device=torch.device('cpu'),
+        dataset=None,
+        pixel_noise_prob=1.0,  # Always apply noise for testing
+        pixel_noise_rate=0.5,  # High rate for testing
+        total_steps=100
+    )
+
+    batch_size = 2
+    max_size = 10
+
+    # Create grids with black pixels
+    grids = torch.zeros(batch_size, max_size, max_size, dtype=torch.long)
+    grids[:, 0, 0] = 5  # Add one non-black pixel
+
+    # Apply noise
+    noisy_grids = trainer.apply_pixel_noise(grids)
+
+    # Should have changed some black pixels to colors 1-9
+    assert noisy_grids.shape == grids.shape
+    changed_pixels = (noisy_grids != grids).sum()
+    assert changed_pixels > 0, "Pixel noise should have changed some pixels"
+
+    print("✓ Pixel noise test passed")
 
 
 def test_data_loading():
@@ -241,6 +434,10 @@ def run_all_tests():
         test_model_forward()
         test_loss_computation()
         test_color_prediction()
+        test_self_conditioning()
+        test_augmentation()
+        test_masking()
+        test_pixel_noise()
         test_data_loading()
 
         print("\n" + "=" * 50)

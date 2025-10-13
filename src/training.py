@@ -258,7 +258,7 @@ class ARCDiffusionTrainer:
 
     def apply_pixel_noise(self, grids: torch.Tensor) -> torch.Tensor:
         """
-        Apply pixel noise to input grids: randomly swap black pixels (0) with colors (1-9).
+        Apply pixel noise to input grids: randomly flip any pixel to a different color.
 
         Args:
             grids: Input grids [batch_size, height, width]
@@ -269,31 +269,30 @@ class ARCDiffusionTrainer:
         if self.pixel_noise_prob <= 0 or self.pixel_noise_rate <= 0:
             return grids
 
-        batch_size = grids.shape[0]
+        batch_size, height, width = grids.shape
         grids_noisy = grids.clone()
 
         for i in range(batch_size):
             # Apply noise to this example with probability pixel_noise_prob
             if torch.rand(1).item() < self.pixel_noise_prob:
-                grid = grids_noisy[i]
+                # Generate noise mask: which pixels to corrupt
+                noise_mask = torch.rand(height, width, device=grids.device) < self.pixel_noise_rate
+                num_corrupted = noise_mask.sum().item()
 
-                # Find all black pixels (value 0)
-                black_mask = (grid == 0)
-                black_indices = torch.where(black_mask)
+                if num_corrupted > 0:
+                    # Get original values at corrupted positions
+                    original_values = grids_noisy[i][noise_mask]
 
-                if len(black_indices[0]) > 0:
-                    # Determine how many black pixels to flip
-                    num_black = len(black_indices[0])
-                    num_to_flip = max(1, int(num_black * self.pixel_noise_rate))
+                    # For each corrupted pixel, sample a different color (0-9, excluding original)
+                    # Strategy: sample from [0, 8], then shift up if >= original value
+                    new_values = torch.randint(0, 9, (num_corrupted,), device=grids.device)
+                    # Shift values that are >= original to avoid duplicates
+                    new_values = torch.where(new_values >= original_values, new_values + 1, new_values)
+                    # Clamp to valid range [0, 9]
+                    new_values = new_values.clamp(0, 9)
 
-                    # Randomly select which black pixels to flip
-                    perm = torch.randperm(num_black)[:num_to_flip]
-                    flip_row_idx = black_indices[0][perm]
-                    flip_col_idx = black_indices[1][perm]
-
-                    # Replace with random colors 1-9 (avoid 0 and 10/PAD)
-                    random_colors = torch.randint(1, 10, (num_to_flip,), device=grids.device)
-                    grids_noisy[i, flip_row_idx, flip_col_idx] = random_colors
+                    # Apply corrupted values
+                    grids_noisy[i][noise_mask] = new_values
 
         return grids_noisy
 

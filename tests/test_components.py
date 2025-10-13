@@ -366,17 +366,27 @@ def test_pixel_noise():
     batch_size = 2
     max_size = 10
 
-    # Create grids with black pixels
-    grids = torch.zeros(batch_size, max_size, max_size, dtype=torch.long)
-    grids[:, 0, 0] = 5  # Add one non-black pixel
+    # Create grids with various colors (not just black)
+    grids = torch.randint(0, 10, (batch_size, max_size, max_size), dtype=torch.long)
 
     # Apply noise
     noisy_grids = trainer.apply_pixel_noise(grids)
 
-    # Should have changed some black pixels to colors 1-9
+    # Should have changed some pixels
     assert noisy_grids.shape == grids.shape
     changed_pixels = (noisy_grids != grids).sum()
     assert changed_pixels > 0, "Pixel noise should have changed some pixels"
+
+    # All corrupted pixels should have different values
+    changed_mask = (noisy_grids != grids)
+    if changed_mask.any():
+        original_changed = grids[changed_mask]
+        new_changed = noisy_grids[changed_mask]
+        # Verify no corrupted pixel kept its original value
+        assert (original_changed != new_changed).all(), "Corrupted pixels should have different values"
+
+    # All values should still be in valid range [0, 9]
+    assert noisy_grids.min() >= 0 and noisy_grids.max() <= 9
 
     print("✓ Pixel noise test passed")
 

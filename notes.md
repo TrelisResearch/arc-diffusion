@@ -2,7 +2,12 @@
 
 ## Daily Notes
 ### Oct 13th 2025
-Running a smol ~10M model for 250k steps, with noise addition to input grids:
+#### Adding 10% noise to all input grids, across all cells (incl. black)
+```bash
+nohup bash -c 'PYTHONUNBUFFERED=1 uv run pipeline.py --config configs/smol_config_aa1.json > smol-v7-aa1-250k-noised-all.log 2>&1' &
+```
+
+#### Running a smol ~10M model for 250k steps, with noise addition to input grids:
 ```bash
 nohup bash -c 'PYTHONUNBUFFERED=1 uv run pipeline.py --config configs/smol_config_aa1.json > smol-v7-aa1-250k-noised.log 2>&1' &
 ```

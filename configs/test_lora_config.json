@@ -1,5 +1,5 @@
 {
-  "model_version": "test-v7",
+  "model_version": "test-v8",
   "tag": "lora-test",
   "pretrained_model_path": "outputs/test/best_model.pt",
   "model": {

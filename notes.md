@@ -1,6 +1,12 @@
 # Diffusion Notes
 
 ## Daily Notes
+### Oct 15th 2025
+#### Simplifying inputs and sc
+```bash
+nohup bash -c 'PYTHONUNBUFFERED=1 uv run pipeline.py --config configs/smol_config_aa1.json > smol-v8-simple-sc.log 2>&1' &
+```
+
 ### Oct 13th 2025
 #### Adding 10% noise to all input grids, across all cells (incl. black)
 ```bash

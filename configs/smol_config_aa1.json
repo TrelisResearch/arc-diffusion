@@ -1,5 +1,5 @@
 {
-  "model_version": "smol-v7-input-noise-all",
+  "model_version": "smol-v8-input-noise-all",
   "tag": "aa1",
   "model": {
     "vocab_size": 11,

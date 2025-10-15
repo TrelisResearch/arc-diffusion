@@ -1,5 +1,5 @@
 {
-  "model_version": "lorge-v7",
+  "model_version": "lorge-v8",
   "tag": "aa2",
   "pretrained_model_path": "outputs/aa2-hard/final_model.pt",
   "model": {

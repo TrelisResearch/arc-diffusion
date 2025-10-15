@@ -147,36 +147,6 @@ class DiscreteNoiseScheduler:
         return alpha_bars.to(device)
 
 
-def sc_gain_from_abar(
-    t_idx: torch.Tensor,
-    scheduler,
-    a: float = 0.3,
-    b: float = 1.0,
-    gamma: float = 1.0
-) -> torch.Tensor:
-    """
-    Self-conditioning gain based on alpha_bar at absolute training indices.
-
-    Args:
-        t_idx: Absolute timestep indices [batch_size], in range [0, T-1]
-        scheduler: Noise scheduler with alpha_bars
-        a: Minimum gain (at high noise, low alpha_bar). Default 0.3
-        b: Maximum gain (at low noise, high alpha_bar). Default 1.0
-        gamma: Exponent for progress curve. Default 1.0 (linear)
-
-    Returns:
-        sc_gain: Self-conditioning gain [batch_size], in range [a, b]
-
-    Examples:
-        - Low alpha_bar (high noise, t≈T-1) → gain ≈ a (0.3)
-        - High alpha_bar (low noise, t≈0) → gain ≈ b (1.0)
-    """
-    abar = scheduler.alpha_bars[t_idx].to(t_idx.device)  # [batch_size], in (0, 1]
-    progress = abar.clamp(min=1e-6)  # Numeric safety
-    gain = a + (b - a) * (progress ** gamma)
-    return gain.clamp(min=a, max=b)  # [batch_size]
-
-
 def create_timestep_embedding(timesteps: torch.Tensor, dim: int) -> torch.Tensor:
     """
     Create sinusoidal timestep embeddings.

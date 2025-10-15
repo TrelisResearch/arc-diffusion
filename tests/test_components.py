@@ -115,10 +115,11 @@ def test_model_forward():
     logsnr = torch.log(alpha_bars) - torch.log1p(-alpha_bars)
 
     # Forward pass
-    logits = model(xt, input_grid, task_ids, logsnr)
+    logits, sc_state = model(xt, input_grid, task_ids, logsnr)
 
     # Check shapes (model outputs 10 classes for colors 0-9)
     assert logits.shape == (batch_size, max_size, max_size, 10)
+    assert sc_state.shape == (batch_size, max_size, max_size, model.d_model)
 
     print("✓ Model forward pass test passed")
 
@@ -200,10 +201,11 @@ def test_color_prediction():
     logsnr = torch.log(alpha_bars) - torch.log1p(-alpha_bars)
 
     # Forward pass
-    logits = model(xt, input_grid, task_ids, logsnr)
+    logits, sc_state = model(xt, input_grid, task_ids, logsnr)
 
     # Check that model predicts 10 color classes (0-9), not PAD
     assert logits.shape == (batch_size, max_size, max_size, 10)
+    assert sc_state.shape == (batch_size, max_size, max_size, model.d_model)
 
     # Sample from logits and check that predictions are valid colors (0-9)
     predictions = torch.argmax(logits, dim=-1)
@@ -240,16 +242,17 @@ def test_self_conditioning():
     logsnr = torch.log(alpha_bars) - torch.log1p(-alpha_bars)
 
     # Test without self-conditioning
-    logits_no_sc = model(xt, input_grid, task_ids, logsnr)
+    logits_no_sc, sc_no_sc = model(xt, input_grid, task_ids, logsnr)
 
     # Test with self-conditioning
-    sc_p0 = torch.randn(batch_size, max_size, max_size, 10)  # Random SC input
-    sc_gain = torch.tensor([1.0, 1.0])
-    logits_with_sc = model(xt, input_grid, task_ids, logsnr, sc_p0=sc_p0, sc_gain=sc_gain)
+    manual_sc_state = torch.randn(batch_size, max_size, max_size, model.d_model)
+    logits_with_sc, sc_with_sc = model(xt, input_grid, task_ids, logsnr, sc_state=manual_sc_state)
 
     # Both should produce valid logits
     assert logits_no_sc.shape == (batch_size, max_size, max_size, 10)
     assert logits_with_sc.shape == (batch_size, max_size, max_size, 10)
+    assert sc_no_sc.shape == (batch_size, max_size, max_size, model.d_model)
+    assert sc_with_sc.shape == (batch_size, max_size, max_size, model.d_model)
 
     # Logits should be different with SC
     assert not torch.allclose(logits_no_sc, logits_with_sc, atol=1e-4)
@@ -288,8 +291,9 @@ def test_augmentation():
     d4_idx = torch.tensor([0, 3])  # Identity and rotation
     color_shift = torch.tensor([0, 2])  # No shift and shift by 2
 
-    logits = model(xt, input_grid, task_ids, logsnr, d4_idx=d4_idx, color_shift=color_shift)
+    logits, sc_state = model(xt, input_grid, task_ids, logsnr, d4_idx=d4_idx, color_shift=color_shift)
     assert logits.shape == (batch_size, max_size, max_size, 10)
+    assert sc_state.shape == (batch_size, max_size, max_size, model.d_model)
 
     print("✓ Augmentation test passed")
 
@@ -328,8 +332,9 @@ def test_masking():
     masks = batch_create_masks(heights, widths, max_size)
 
     # Forward with masks
-    logits = model(xt, input_grid, task_ids, logsnr, masks=masks)
+    logits, sc_state = model(xt, input_grid, task_ids, logsnr, masks=masks)
     assert logits.shape == (batch_size, max_size, max_size, 10)
+    assert sc_state.shape == (batch_size, max_size, max_size, model.d_model)
 
     print("✓ Masking test passed")
 

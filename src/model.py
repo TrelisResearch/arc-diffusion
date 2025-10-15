@@ -4,7 +4,7 @@ Discrete diffusion model for ARC tasks with size prediction and transformer back
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple, Optional, Dict, Union
+from typing import Tuple, Optional, Dict, Any
 
 from utils.noise_scheduler import create_timestep_embedding
 
@@ -85,18 +85,6 @@ class TransformerDenoiser(nn.Module):
             nn.Linear(d_model, d_model)
         )
 
-        # Self-conditioning projection
-        # Maps log-probability distributions (10 classes) to features
-        # LayerNorm keeps scale consistent across timesteps
-        self.sc_proj = nn.Sequential(
-            nn.Linear(10, d_model, bias=True),
-            nn.LayerNorm(d_model)
-        )
-
-        # Learnable scalar gate for self-conditioning (initialized to 0.3)
-        # Allows model to downweight SC when harmful
-        self.sc_gate = nn.Parameter(torch.tensor(0.3))
-
         # Embedding dropout for regularization
         self.embedding_dropout = nn.Dropout(embedding_dropout)
 
@@ -125,14 +113,14 @@ class TransformerDenoiser(nn.Module):
         d4_idx: Optional[torch.Tensor] = None,  # [batch_size] - D4 transformation index (0-7)
         color_shift: Optional[torch.Tensor] = None,  # [batch_size] - color shift (0-8)
         masks: Optional[torch.Tensor] = None,  # [batch_size, max_size, max_size]
-        sc_p0: Optional[torch.Tensor] = None,  # [batch_size, max_size, max_size, 10] - self-conditioning log-probs (centered)
-        sc_gain: Union[float, torch.Tensor] = 1.0,  # float or [batch_size] - Self-conditioning gain factor
-    ) -> torch.Tensor:
+        sc_state: Optional[torch.Tensor] = None,  # [batch_size, max_size, max_size, d_model] - self-conditioning features
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass of the denoiser.
 
         Returns:
             logits: [batch_size, max_size, max_size, 10] - predicted logits for colors 0-9
+            sc_next: [batch_size, max_size, max_size, d_model] - hidden features for self-conditioning
         """
         batch_size = xt.shape[0]
         device = xt.device
@@ -154,33 +142,14 @@ class TransformerDenoiser(nn.Module):
         input_emb = self.embedding_dropout(input_emb)
         xt_emb = self.embedding_dropout(xt_emb)
 
-        # Handle self-conditioning
-        # When sc_p0 is None, we add nothing (true zero, no bias injection)
-        if sc_p0 is not None:
-            # Reshape SC input (log-probs, centered)
-            sc_p0_flat = sc_p0.view(batch_size, -1, 10)  # [batch_size, max_size^2, 10]
-
-            # Apply masking to SC input (zero outside valid regions)
-            if masks is not None:
-                masks_flat = masks.view(batch_size, -1, 1).float()  # [batch_size, max_size^2, 1]
-                sc_p0_flat = sc_p0_flat * masks_flat
-
-            # Project with LayerNorm
-            sc_features = self.sc_proj(sc_p0_flat)  # [batch_size, max_size^2, d_model]
-
-            # Add to xt embeddings with gain factor and learnable gate
-            # Reshape sc_gain from [batch_size] to [batch_size, 1, 1] for broadcasting if it's a tensor
-            if isinstance(sc_gain, torch.Tensor):
-                sc_gain_reshaped = sc_gain.view(batch_size, 1, 1)
-            else:
-                sc_gain_reshaped = sc_gain
-            xt_emb = xt_emb + sc_gain_reshaped * self.sc_gate * sc_features
-
-        # Apply masking to xt features if masks provided
-        # Zero out embeddings outside valid regions
+        masks_flat = None
         if masks is not None:
-            masks_flat = masks.view(batch_size, -1, 1).float()  # [batch_size, max_size^2, 1]
+            masks_flat = masks.view(batch_size, -1, 1).float()
+
+        # Apply masking to embeddings if masks provided
+        if masks_flat is not None:
             xt_emb = xt_emb * masks_flat  # Zero out invalid regions
+            input_emb = input_emb * masks_flat
 
         # Apply input grid conditioning dropout (training only)
         if self.training and self.input_grid_dropout > 0:
@@ -190,6 +159,20 @@ class TransformerDenoiser(nn.Module):
             dropout_mask = torch.bernoulli(torch.full((batch_size, 1, 1), keep_prob, device=device))
             # Apply dropout with scaling to maintain expectation
             input_emb = input_emb * dropout_mask / keep_prob
+
+        # Combine input and noisy embeddings element-wise
+        combined_emb = input_emb + xt_emb
+
+        # Add self-conditioning features if provided
+        if sc_state is not None:
+            sc_state_flat = sc_state.view(batch_size, -1, self.d_model)
+
+            if masks_flat is None and masks is not None:
+                masks_flat = masks.view(batch_size, -1, 1).float()
+            if masks_flat is not None:
+                sc_state_flat = sc_state_flat * masks_flat
+
+            combined_emb = combined_emb + sc_state_flat
 
         # Create separate conditioning tokens
         task_token = self.task_embedding(task_ids).unsqueeze(1)  # [batch_size, 1, d_model]
@@ -211,28 +194,28 @@ class TransformerDenoiser(nn.Module):
         d4_token = self.d4_embedding(d4_idx).unsqueeze(1)  # [batch_size, 1, d_model]
         color_shift_token = self.color_shift_embedding(color_shift).unsqueeze(1)  # [batch_size, 1, d_model]
 
-        # Concatenate in sequence dimension: [task, time, d4, color_shift, input_grid, noised_output]
+        # Concatenate in sequence dimension: [task, time, d4, color_shift, combined_grid]
         sequence = torch.cat([
             task_token,         # [batch_size, 1, d_model]
             time_token,         # [batch_size, 1, d_model]
             d4_token,           # [batch_size, 1, d_model]
             color_shift_token,  # [batch_size, 1, d_model]
-            input_emb,          # [batch_size, max_size^2, d_model]
-            xt_emb              # [batch_size, max_size^2, d_model]
-        ], dim=1)  # [batch_size, 4 + 2*max_size^2, d_model]
+            combined_emb        # [batch_size, max_size^2, d_model]
+        ], dim=1)  # [batch_size, 4 + max_size^2, d_model]
 
         # Single transformer processes the entire sequence
-        output = self.transformer(sequence)  # [batch_size, 4 + 2*max_size^2, d_model]
+        output = self.transformer(sequence)  # [batch_size, 4 + max_size^2, d_model]
 
-        # Extract predictions for noised output positions (skip task + time + d4 + color_shift + input)
-        output_start_idx = 4 + self.max_size * self.max_size
-        output_preds = output[:, output_start_idx:, :]  # [batch_size, max_size^2, d_model]
+        # Extract predictions for grid positions (skip task/time/d4/color_shift tokens)
+        output_preds = output[:, 4:, :]  # [batch_size, max_size^2, d_model]
 
         # Predict logits for each cell (only for colors 0-9)
         logits = self.output_head(output_preds)  # [batch_size, max_size^2, 10]
         logits = logits.view(batch_size, self.max_size, self.max_size, 10)
 
-        return logits
+        sc_next = output_preds.view(batch_size, self.max_size, self.max_size, self.d_model)
+
+        return logits, sc_next
 
 
 
@@ -253,8 +236,8 @@ class ARCDiffusionModel(nn.Module):
         embedding_dropout: float = 0.1,
         input_grid_dropout: float = 0.0,
         include_size_head: bool = True,
-        size_head_hidden_dim: int = None,
-        noise_scheduler=None,
+        size_head_hidden_dim: int | None = None,
+        noise_scheduler: Any | None = None,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -299,11 +282,15 @@ class ARCDiffusionModel(nn.Module):
         d4_idx: Optional[torch.Tensor] = None,
         color_shift: Optional[torch.Tensor] = None,
         masks: Optional[torch.Tensor] = None,
-        sc_p0: Optional[torch.Tensor] = None,
-        sc_gain: Union[float, torch.Tensor] = 1.0,
-    ) -> torch.Tensor:
-        """Forward pass - predict x0 given xt."""
-        return self.denoiser(xt, input_grid, task_ids, logsnr, d4_idx, color_shift, masks, sc_p0, sc_gain)
+        sc_state: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass - predict x0 given xt.
+
+        Returns:
+            logits: [batch_size, max_size, max_size, 10]
+            sc_next: [batch_size, max_size, max_size, d_model]
+        """
+        return self.denoiser(xt, input_grid, task_ids, logsnr, d4_idx, color_shift, masks, sc_state)
 
     def _compute_bucket_metrics(
         self,
@@ -359,11 +346,9 @@ class ARCDiffusionModel(nn.Module):
         heights: Optional[torch.Tensor] = None,  # [batch_size] - grid heights
         widths: Optional[torch.Tensor] = None,   # [batch_size] - grid widths
         auxiliary_size_loss_weight: float = 0.1,  # Weight for auxiliary size loss
-        sc_p0: Optional[torch.Tensor] = None,
-        sc_gain: Union[float, torch.Tensor] = 1.0,
+        sc_state: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """Compute training losses with optional masking for pad regions."""
-        batch_size = x0.shape[0]
         max_size = x0.shape[1]
 
         # Create masks for valid positions if heights/widths provided (vectorized)
@@ -375,7 +360,7 @@ class ARCDiffusionModel(nn.Module):
             mask_bool = masks.bool()  # Reuse same mask as bool for indexing
 
         # Forward pass with masks
-        logits = self.forward(
+        logits, _ = self.forward(
             xt=xt,
             input_grid=input_grid,
             task_ids=task_ids,
@@ -383,8 +368,7 @@ class ARCDiffusionModel(nn.Module):
             d4_idx=d4_idx,
             color_shift=color_shift,
             masks=masks,
-            sc_p0=sc_p0,
-            sc_gain=sc_gain
+            sc_state=sc_state,
         )
 
         # Apply mask for loss computation if provided

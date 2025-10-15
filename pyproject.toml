@@ -10,7 +10,8 @@ dependencies = [
     "matplotlib>=3.7.0",
     "huggingface-hub>=0.20.0",
     "wandb",
-    "hf_transfer"
+    "hf_transfer",
+    "pytest>=8.4.2",
 ]
 
 [project.optional-dependencies]

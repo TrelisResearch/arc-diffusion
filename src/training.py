@@ -16,8 +16,6 @@ from utils.visualization import create_training_visualization, create_denoising_
 from torch.utils.data import DataLoader
 
 # Self-conditioning temperature for log-softmax (helps stability at high noise)
-SC_TEMPERATURE = 1.5
-
 
 def discrete_reverse_step(
     x_t: torch.Tensor,
@@ -74,7 +72,7 @@ def discrete_reverse_step(
     return x_tm1
 
 
-def prepare_ema_state_dict(model, ema, use_lora: bool, lora_config: dict = None):
+def prepare_ema_state_dict(model, ema, use_lora: bool, lora_config: dict | None = None):
     """
     Prepare EMA state dict, merging LoRA weights if applicable.
 
@@ -154,8 +152,7 @@ class ARCDiffusionTrainer:
         ema_decay: float = 0.9995,
         ema_warmup_steps: int = 1000,
         gradient_accumulation_steps: int = 1,
-        lr_warmup_steps: int = None,
-        sc_dropout_prob: float = 0.5
+        lr_warmup_steps: int | None = None
     ):
         self.model = model
         self.noise_scheduler = noise_scheduler
@@ -167,7 +164,6 @@ class ARCDiffusionTrainer:
         self.auxiliary_size_loss_weight = auxiliary_size_loss_weight
         self.use_ema = use_ema
         self.gradient_accumulation_steps = gradient_accumulation_steps
-        self.sc_dropout_prob = sc_dropout_prob
 
         # Set up mixed precision
         if use_mixed_precision and device.type in ['cuda', 'mps']:
@@ -336,7 +332,7 @@ class ARCDiffusionTrainer:
         with torch.no_grad():
             if self.use_mixed_precision and self.device.type in ['cuda', 'mps']:
                 with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype):
-                    logits_t = self.model(
+                    logits_t, sc_prev_t = self.model(
                         xt=noisy_grids_t,
                         input_grid=input_grids,
                         task_ids=task_indices,
@@ -344,11 +340,10 @@ class ARCDiffusionTrainer:
                         d4_idx=d4_indices,
                         color_shift=color_shifts,
                         masks=masks,
-                        sc_p0=None,  # No self-conditioning in first pass
-                        sc_gain=0.0
+                        sc_state=None
                     )
             else:
-                logits_t = self.model(
+                logits_t, sc_prev_t = self.model(
                     xt=noisy_grids_t,
                     input_grid=input_grids,
                     task_ids=task_indices,
@@ -356,15 +351,10 @@ class ARCDiffusionTrainer:
                     d4_idx=d4_indices,
                     color_shift=color_shifts,
                     masks=masks,
-                    sc_p0=None,  # No self-conditioning in first pass
-                    sc_gain=0.0
+                    sc_state=None
                 )
 
-            # Build SC features from logits_t (centered log-probs with temperature)
-            # Use fp32 for stability (helps prevent NaNs at high noise)
-            logits_fp32 = logits_t.float()
-            log_probs_t = torch.log_softmax(logits_fp32 / SC_TEMPERATURE, dim=-1).to(logits_t.dtype)
-            sc_prev_t = log_probs_t - log_probs_t.mean(dim=-1, keepdim=True)
+            sc_prev_t = sc_prev_t.detach()
 
             # Teacher-force one reverse step to get x_{t-1}
             x_tm1 = discrete_reverse_step(
@@ -380,12 +370,7 @@ class ARCDiffusionTrainer:
         alpha_bars_tm1 = self.noise_scheduler.alpha_bars[t_minus_1].clamp(1e-6, 1-1e-6).to(self.device)
         logsnr_tm1 = torch.log(alpha_bars_tm1) - torch.log1p(-alpha_bars_tm1)
 
-        from utils.noise_scheduler import sc_gain_from_abar
-        sc_gain_tm1 = sc_gain_from_abar(t_minus_1, self.noise_scheduler)
-
-        # Apply SC dropout for the receiving step (t-1)
-        use_sc = (torch.rand(1, device=self.device).item() > self.sc_dropout_prob)
-        sc_for_tm1 = sc_prev_t if use_sc else None
+        sc_for_tm1 = sc_prev_t
 
         # === Second pass at t-1 with SC from t → compute loss ===
         if self.use_mixed_precision and self.device.type in ['cuda', 'mps']:
@@ -401,8 +386,7 @@ class ARCDiffusionTrainer:
                     heights=heights,
                     widths=widths,
                     auxiliary_size_loss_weight=self.auxiliary_size_loss_weight,
-                    sc_p0=sc_for_tm1,  # prev-t SC (or None if dropped)
-                    sc_gain=sc_gain_tm1
+                    sc_state=sc_for_tm1
                 )
         else:
             losses = self.model.compute_loss(
@@ -416,8 +400,7 @@ class ARCDiffusionTrainer:
                 heights=heights,
                 widths=widths,
                 auxiliary_size_loss_weight=self.auxiliary_size_loss_weight,
-                sc_p0=sc_for_tm1,
-                sc_gain=sc_gain_tm1
+                sc_state=sc_for_tm1
             )
 
         # Backward pass with mixed precision and gradient accumulation
@@ -522,7 +505,7 @@ class ARCDiffusionTrainer:
                 # === TEMPORAL SC: First pass at t (no SC) to get logits ===
                 if self.use_mixed_precision and self.device.type in ['cuda', 'mps']:
                     with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype):
-                        logits_t = self.model(
+                        logits_t, sc_prev_t = self.model(
                             xt=noisy_grids_t,
                             input_grid=input_grids,
                             task_ids=task_indices,
@@ -530,11 +513,10 @@ class ARCDiffusionTrainer:
                             d4_idx=d4_indices,
                             color_shift=color_shifts,
                             masks=masks,
-                            sc_p0=None,
-                            sc_gain=0.0
+                            sc_state=None
                         )
                 else:
-                    logits_t = self.model(
+                    logits_t, sc_prev_t = self.model(
                         xt=noisy_grids_t,
                         input_grid=input_grids,
                         task_ids=task_indices,
@@ -542,14 +524,9 @@ class ARCDiffusionTrainer:
                         d4_idx=d4_indices,
                         color_shift=color_shifts,
                         masks=masks,
-                        sc_p0=None,
-                        sc_gain=0.0
+                        sc_state=None
                     )
-
-                # Build SC features from logits_t (centered log-probs with temperature)
-                logits_fp32 = logits_t.float()
-                log_probs_t = torch.log_softmax(logits_fp32 / SC_TEMPERATURE, dim=-1).to(logits_t.dtype)
-                sc_prev_t = log_probs_t - log_probs_t.mean(dim=-1, keepdim=True)
+                sc_prev_t = sc_prev_t.detach()
 
                 # Teacher-force one reverse step to get x_{t-1}
                 x_tm1 = discrete_reverse_step(
@@ -565,9 +542,6 @@ class ARCDiffusionTrainer:
                 alpha_bars_tm1 = self.noise_scheduler.alpha_bars[t_minus_1].clamp(1e-6, 1-1e-6).to(self.device)
                 logsnr_tm1 = torch.log(alpha_bars_tm1) - torch.log1p(-alpha_bars_tm1)
 
-                from utils.noise_scheduler import sc_gain_from_abar
-                sc_gain_tm1 = sc_gain_from_abar(t_minus_1, self.noise_scheduler)
-
                 # === Second pass at t-1 with SC from t (no dropout in validation) ===
                 if self.use_mixed_precision and self.device.type in ['cuda', 'mps']:
                     with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype):
@@ -581,8 +555,7 @@ class ARCDiffusionTrainer:
                             widths=widths,
                             d4_idx=d4_indices,
                             color_shift=color_shifts,
-                            sc_p0=sc_prev_t,  # prev-t SC (no dropout in validation)
-                            sc_gain=sc_gain_tm1
+                            sc_state=sc_prev_t
                         )
                 else:
                     losses = self.model.compute_loss(
@@ -595,8 +568,7 @@ class ARCDiffusionTrainer:
                         widths=widths,
                         d4_idx=d4_indices,
                         color_shift=color_shifts,
-                        sc_p0=sc_prev_t,
-                        sc_gain=sc_gain_tm1
+                        sc_state=sc_prev_t
                     )
 
                 # Initialize total_losses on first batch
@@ -653,8 +625,8 @@ class ARCDiffusionTrainer:
 
             if self.ema is not None:
                 # Use EMA weights as the main model state (already merged via prepare_ema_state_dict)
-                lora_config = config.get('lora', {}) if use_lora else None
-                model_state_dict = prepare_ema_state_dict(self.model, self.ema, use_lora, lora_config)
+                lora_config_val: dict | None = config.get('lora', {}) if use_lora else None
+                model_state_dict = prepare_ema_state_dict(self.model, self.ema, use_lora, lora_config_val)
             else:
                 # No EMA - fall back to current training weights (requires manual merging)
                 raw_state_dict = self.model.state_dict()
@@ -789,22 +761,25 @@ def train_arc_diffusion(config: Dict[str, Any]) -> ARCDiffusionModel:
         wandb = None  # Set to None if not using W&B
 
     # Load data paths
+    datasets_val: list[str] | None = config.get('datasets', None)
     data_paths = load_arc_data_paths(
         data_dir=config.get('data_dir', 'data/arc-prize-2025'),
-        datasets=config.get('datasets', None)
+        datasets=datasets_val
     )
 
     # Create full dataset first
     max_val_examples = config.get('max_val_examples', 128)
     eval_weight = config.get('eval_weight', 1.0)
 
+    subset_file_val: str | None = config.get('subset_file', None)
+    eval_subset_file_val: str | None = config.get('eval_subset_file', None)
     full_dataset = ARCDataset(
         data_paths=data_paths['train'],
         max_size=config['max_size'],
         augment=config['augment'],
         include_training_test_examples=config.get('include_training_test_examples', True),
-        subset_file=config.get('subset_file', None),
-        eval_subset_file=config.get('eval_subset_file', None),
+        subset_file=subset_file_val,
+        eval_subset_file=eval_subset_file_val,
         eval_weight=eval_weight,
         max_val_examples=max_val_examples
     )
@@ -947,22 +922,26 @@ def train_arc_diffusion(config: Dict[str, Any]) -> ARCDiffusionModel:
 
         # Determine max_tasks: need to accommodate both pretrained tasks AND new tasks
         pretrained_max_tasks = 0
-        pretrained_task_id_to_idx = {}
+        pretrained_task_id_to_idx: dict[str, int] = {}
         if 'dataset_info' in checkpoint:
             if 'num_tasks' in checkpoint['dataset_info']:
-                pretrained_max_tasks = checkpoint['dataset_info']['num_tasks']
+                num_tasks_val = checkpoint['dataset_info']['num_tasks']
+                if isinstance(num_tasks_val, int):
+                    pretrained_max_tasks = num_tasks_val
             if 'task_id_to_idx' in checkpoint['dataset_info']:
-                pretrained_task_id_to_idx = checkpoint['dataset_info']['task_id_to_idx']
+                task_mapping = checkpoint['dataset_info']['task_id_to_idx']
+                if isinstance(task_mapping, dict):
+                    pretrained_task_id_to_idx = task_mapping
 
         pretrained_task_ids = set(pretrained_task_id_to_idx.keys())
         current_task_ids = set(dataset_info['task_id_to_idx'].keys())
         new_task_ids = current_task_ids - pretrained_task_ids
 
         # Merge task mappings: keep all pretrained mappings + add new tasks
-        merged_task_id_to_idx = pretrained_task_id_to_idx.copy()
+        merged_task_id_to_idx: dict[str, int] = pretrained_task_id_to_idx.copy()
         if new_task_ids:
             # Assign new indices starting from the max of pretrained indices
-            next_idx = max(pretrained_task_id_to_idx.values()) + 1 if pretrained_task_id_to_idx else 0
+            next_idx: int = max(pretrained_task_id_to_idx.values()) + 1 if pretrained_task_id_to_idx else 0
             for task_id in new_task_ids:
                 merged_task_id_to_idx[task_id] = next_idx
                 next_idx += 1
@@ -1162,6 +1141,7 @@ def train_arc_diffusion(config: Dict[str, Any]) -> ARCDiffusionModel:
     print(f"Training setup: {optimizer_steps} optimizer steps (~{estimated_epochs:.1f} epochs at {steps_per_epoch} steps/epoch)")
 
     # Create trainer
+    lr_warmup: int | None = config.get('lr_warmup_steps', None)
     trainer = ARCDiffusionTrainer(
         model=model,
         noise_scheduler=noise_scheduler,
@@ -1178,8 +1158,7 @@ def train_arc_diffusion(config: Dict[str, Any]) -> ARCDiffusionModel:
         ema_decay=config.get('ema_decay', 0.9995),
         ema_warmup_steps=config.get('ema_warmup_steps', 1000),
         gradient_accumulation_steps=config.get('gradient_accumulation_steps', 1),
-        lr_warmup_steps=config.get('lr_warmup_steps', None),
-        sc_dropout_prob=config.get('sc_dropout_prob', 0.5)
+        lr_warmup_steps=lr_warmup,
     )
 
     print(f"Model has {sum(p.numel() for p in model.parameters()):,} parameters")

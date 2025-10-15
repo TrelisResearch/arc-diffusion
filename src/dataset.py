@@ -5,7 +5,7 @@ import json
 import torch
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 import random
 from pathlib import Path
 
@@ -25,8 +25,8 @@ class ARCDataset(Dataset):
         max_size: int = 30,
         augment: bool = True,
         include_training_test_examples: bool = True,
-        subset_file: str = None,
-        eval_subset_file: str = None,
+        subset_file: Optional[str] = None,
+        eval_subset_file: Optional[str] = None,
         eval_weight: float = 1.0,
         max_val_examples: int = 128,
     ):
@@ -315,7 +315,7 @@ class ARCDataset(Dataset):
         }
 
 
-    def get_task_info(self) -> Dict[str, int]:
+    def get_task_info(self) -> Dict[str, Any]:
         """Get information about tasks in the dataset."""
         return {
             'num_tasks': len(self.task_id_to_idx),
@@ -378,7 +378,7 @@ class ARCDataLoader:
         )
 
 
-def load_arc_data_paths(data_dir: str = "data/arc-prize-2025", datasets: List[str] = None) -> Dict[str, List[str]]:
+def load_arc_data_paths(data_dir: str = "data/arc-prize-2025", datasets: Optional[List[str]] = None) -> Dict[str, List[str]]:
     """
     Get ARC data paths for training.
 

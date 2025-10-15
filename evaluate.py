@@ -35,8 +35,6 @@ import random
 from collections import Counter
 
 # Self-conditioning temperature for log-softmax (helps stability at high noise)
-SC_TEMPERATURE = 1.5
-
 
 class AugmentationParams(TypedDict):
     """Parameters for a single D4 augmentation"""
@@ -680,17 +678,12 @@ class DiffusionInference:
                 alpha_bars = self.noise_scheduler.alpha_bars[t_batch].clamp(1e-6, 1-1e-6).to(self.device)
                 logsnr = torch.log(alpha_bars) - torch.log1p(-alpha_bars)
 
-                # Calculate self-conditioning gain based on alpha_bar (noise level)
-                from utils.noise_scheduler import sc_gain_from_abar
-                sc_gain = sc_gain_from_abar(t_batch, self.noise_scheduler)
-
                 # === TEMPORAL SC: one pass per step, feed previous step's SC ===
-                logits = self.model(
+                logits, prev_sc_features = self.model(
                     x_t, input_grids, task_indices, logsnr,
                     d4_idx=d4_idx, color_shift=color_shift,
                     masks=mask_float,
-                    sc_p0=prev_sc,            # <-- use prev step SC (None on first step)
-                    sc_gain=sc_gain
+                    sc_state=prev_sc
                 )
 
                 # Get predicted probabilities for statistics
@@ -736,10 +729,7 @@ class DiffusionInference:
 
                 # === Build SC for the *next* step ===
                 # Use fp32 for stability; centered log-probs; detach so it's a feature only
-                logits_fp32 = logits.float()
-                log_probs = torch.log_softmax(logits_fp32 / SC_TEMPERATURE, dim=-1).to(logits.dtype)
-                prev_sc = log_probs - log_probs.mean(dim=-1, keepdim=True)
-                prev_sc = prev_sc.detach()
+                prev_sc = prev_sc_features.detach()
 
                 # Capture intermediate steps with their timestep
                 if i % capture_interval == 0 or i == num_inference_steps - 1:

@@ -149,7 +149,6 @@ class TransformerDenoiser(nn.Module):
         # Apply masking to embeddings if masks provided
         if masks_flat is not None:
             xt_emb = xt_emb * masks_flat  # Zero out invalid regions
-            input_emb = input_emb * masks_flat
 
         # Apply input grid conditioning dropout (training only)
         if self.training and self.input_grid_dropout > 0:
@@ -555,5 +554,4 @@ class ARCDiffusionModel(nn.Module):
         predicted_widths = torch.argmax(width_logits, dim=-1) + 1
 
         return predicted_heights, predicted_widths
-
 

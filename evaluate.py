@@ -20,7 +20,7 @@ import sys
 import traceback
 import numpy as np
 from pathlib import Path
-from typing import Dict, List, Optional, TypedDict, Tuple, Any
+from typing import Dict, List, Optional, TypedDict, Tuple, Any, Union
 from tqdm import tqdm
 import torch
 import matplotlib.pyplot as plt
@@ -28,11 +28,11 @@ import matplotlib.pyplot as plt
 from src.model import ARCDiffusionModel
 from utils.noise_scheduler import DiscreteNoiseScheduler
 from src.dataset import ARCDataset, load_arc_data_paths
-from utils.grid_utils import grid_to_tokens, tokens_to_grid, TaskAugmentation
+from utils.grid_utils import grid_to_tokens, TaskAugmentation
 from utils.task_filters import filter_tasks_by_max_size
 from utils.arc_colors import arc_cmap
-import random
 from collections import Counter
+from src.training import discrete_reverse_step
 
 # Self-conditioning temperature for log-softmax (helps stability at high noise)
 
@@ -196,7 +196,7 @@ class DiffusionInference:
 
         # Check for integrated size head in model
         if hasattr(self.model, 'include_size_head') and self.model.include_size_head:
-            print(f"✓ Using integrated size head from model")
+            print("✓ Using integrated size head from model")
 
         if self.num_inference_steps is None:
             self.num_inference_steps = self.config['num_timesteps']
@@ -260,7 +260,7 @@ class DiffusionInference:
 
         # Load weights (model_state_dict contains EMA weights if EMA was used during training)
         model.load_state_dict(state_dict)
-        print(f"✓ Loaded model weights from checkpoint")
+        print("✓ Loaded model weights from checkpoint")
 
         model.to(self.device)
         model.eval()
@@ -276,7 +276,7 @@ class DiffusionInference:
                 with torch.no_grad():
                     task_idx_tensor = torch.tensor([task_idx], device=self.device)
                     task_emb = self.model.denoiser.task_embedding(task_idx_tensor)
-                    print(f"\n🔍 DEBUG: Inference task embedding verification")
+                    print("\n🔍 DEBUG: Inference task embedding verification")
                     print(f"  Task ID: {task_id}")
                     print(f"  Task index (from task_id_to_idx): {task_idx}")
                     print(f"  Task embedding (first 10 dims): {task_emb[0, :10].cpu().numpy()}")
@@ -641,7 +641,6 @@ class DiffusionInference:
 
         # Initialize with uniform random noise
         x_t = torch.randint(0, 10, (batch_size, max_size, max_size), device=self.device)
-        x_prev = x_t.clone()
 
         # Storage for intermediate steps (grid, timestep) tuples
         intermediate_steps = []
@@ -663,6 +662,10 @@ class DiffusionInference:
         valid_mask = torch.zeros((batch_size, max_size, max_size), dtype=torch.bool, device=self.device)
         for b in range(batch_size):
             valid_mask[b, :pred_height, :pred_width] = True
+
+        # Clamp initial noise outside the valid region (matches training behaviour)
+        x_t = torch.where(valid_mask, x_t, torch.zeros_like(x_t))
+        x_prev_state = x_t.clone()
 
         # Create float mask for model
         mask_float = valid_mask.float()
@@ -704,34 +707,33 @@ class DiffusionInference:
                 mean_entropy = entropy.mean().item()
                 entropy_curve.append(mean_entropy)
 
-                # Use deterministic argmax at all steps for ARC tasks
-                # (sampling can be re-enabled if diversity is needed)
-                x_t = torch.argmax(logits, dim=-1)
+                if t.item() > 0:
+                    x_next = discrete_reverse_step(
+                        x_t=x_t,
+                        logits_x0=logits,
+                        t_idx=t_batch,
+                        noise_scheduler=self.noise_scheduler,
+                        mask=valid_mask
+                    )
+                else:
+                    x_next = torch.argmax(logits, dim=-1)
+                    x_next = torch.where(valid_mask, x_next, torch.zeros_like(x_next))
 
-                # Apply size masking
-                for b in range(batch_size):
-                    if pred_height < max_size:
-                        x_t[b, pred_height:, :] = 0
-                    if pred_width < max_size:
-                        x_t[b, :, pred_width:] = 0
-
-                # Compute delta-change (fraction of cells that changed in valid region)
                 if i > 0:
-                    changed = (x_t != x_prev) & valid_mask
+                    changed = (x_next != x_prev_state) & valid_mask
                     delta = changed.sum().item() / valid_mask.sum().item()
                     delta_change_curve.append(delta)
 
-                    # Check for early-lock: delta <= 1% and confidence >= 95%
                     if early_lock_step is None and delta <= 0.01 and mean_confidence >= 0.95:
                         early_lock_step = i
 
-                x_prev = x_t.clone()
+                x_prev_state = x_next.clone()
+                x_t = x_next
 
                 # === Build SC for the *next* step ===
                 # Use fp32 for stability; centered log-probs; detach so it's a feature only
                 prev_sc = prev_sc_features.detach()
 
-                # Capture intermediate steps with their timestep
                 if i % capture_interval == 0 or i == num_inference_steps - 1:
                     intermediate_steps.append((x_t[0].cpu().numpy().copy(), t.item()))
 
@@ -909,7 +911,14 @@ class DiffusionInference:
             num_valid_cells=int(num_valid_cells)
         )
 
-    def predict_single(self, input_grid: np.ndarray, task_idx: int, task_id: str = None, expected_output: np.ndarray = None, capture_steps: bool = False) -> Tuple[np.ndarray, Optional[str], str]:
+    def predict_single(
+        self,
+        input_grid: np.ndarray,
+        task_idx: int,
+        task_id: Optional[str] = None,
+        expected_output: Optional[np.ndarray] = None,
+        capture_steps: bool = False
+    ) -> Tuple[np.ndarray, Optional[str], str, Optional[List[Tuple[np.ndarray, int]]], Optional[TrajectoryStats]]:
         """
         Run single prediction on input grid.
 
@@ -1079,7 +1088,15 @@ class DiffusionInference:
             num_train_examples=len(task_data["train"])
         )
 
-    def _run_smart_voting(self, input_grid: np.ndarray, expected_output: np.ndarray, test_idx: int, task_idx: int, task_id: str = None, print_stats: bool = False) -> tuple[DiffusionResult, DiffusionResult]:
+    def _run_smart_voting(
+        self,
+        input_grid: np.ndarray,
+        expected_output: np.ndarray,
+        test_idx: int,
+        task_idx: int,
+        task_id: Optional[str] = None,
+        print_stats: bool = False
+    ) -> Tuple[DiffusionResult, DiffusionResult]:
         """
         Run smart confidence-split majority voting that returns top-2 predictions.
         Uses all 72 D4 augmentations.
@@ -1096,43 +1113,58 @@ class DiffusionInference:
         )
 
         # Check correctness for both predictions
-        def check_prediction(predicted_grid):
+        def build_result(predicted_grid: np.ndarray) -> DiffusionResult:
             correct = False
-            error = None
-            if len(expected_output) > 0 and len(predicted_grid) > 0:
+            error: Optional[str] = None
+            if expected_output.size > 0 and predicted_grid.size > 0:
                 try:
                     if predicted_grid.shape == expected_output.shape:
                         correct = np.array_equal(predicted_grid, expected_output)
                     else:
                         error = f"Shape mismatch: predicted {predicted_grid.shape} vs expected {expected_output.shape}"
-                except Exception as e:
-                    error = f"Comparison failed: {str(e)}"
-            elif len(predicted_grid) == 0:
+                except Exception as ex:
+                    error = f"Comparison failed: {str(ex)}"
+            elif predicted_grid.size == 0:
                 error = "No valid region extracted from prediction"
 
-            # Compute copy statistics
             copy_stats = None
-            if error is None and len(predicted_grid) > 0 and len(expected_output) > 0:
+            if error is None and predicted_grid.size > 0 and expected_output.size > 0:
                 copy_stats = self.compute_copy_stats(predicted_grid, input_grid, expected_output)
 
-            return {
-                "predicted_grid": predicted_grid.tolist() if len(predicted_grid) > 0 else [],
-                "expected": expected_output.tolist(),
-                "correct": correct,
-                "error": error,
-                "pred_height": predicted_grid.shape[0] if len(predicted_grid) > 0 else 0,
-                "pred_width": predicted_grid.shape[1] if len(predicted_grid) > 0 else 0,
-                "size_source": "confidence_split_voting",
-                "copy_stats": copy_stats,
-                "trajectory_stats": None
-            }
+            predicted_list: Optional[List[List[int]]] = (
+                predicted_grid.astype(int).tolist() if predicted_grid.size > 0 else None
+            )
 
-        result1 = check_prediction(pred1)
-        result2 = check_prediction(pred2)
+            return DiffusionResult(
+                test_idx=test_idx,
+                input_grid=input_grid.astype(int).tolist(),
+                predicted=predicted_list,
+                expected=expected_output.astype(int).tolist() if expected_output.size > 0 else [],
+                correct=correct,
+                error=error,
+                pred_height=int(predicted_grid.shape[0]) if predicted_grid.size > 0 else 0,
+                pred_width=int(predicted_grid.shape[1]) if predicted_grid.size > 0 else 0,
+                size_source="confidence_split_voting",
+                copy_stats=copy_stats,
+                trajectory_stats=None
+            )
+
+        result1 = build_result(pred1)
+        result2 = build_result(pred2)
 
         return result1, result2
 
-    def _run_attempt(self, input_grid: np.ndarray, expected_output: np.ndarray, test_idx: int, task_idx: int, task_id: str = None, capture_steps: bool = False, use_majority_voting: bool = False, print_stats: bool = False) -> DiffusionResult:
+    def _run_attempt(
+        self,
+        input_grid: np.ndarray,
+        expected_output: np.ndarray,
+        test_idx: int,
+        task_idx: int,
+        task_id: Optional[str] = None,
+        capture_steps: bool = False,
+        use_majority_voting: bool = False,
+        print_stats: bool = False
+    ) -> Union[DiffusionResult, Tuple[DiffusionResult, List[Tuple[np.ndarray, int]]]]:
         """Run a single diffusion attempt with copy and trajectory statistics"""
         if use_majority_voting:
             # Generate all 72 augmentations
@@ -1184,14 +1216,14 @@ class DiffusionInference:
 
         # Compute copy statistics if we have valid prediction and target
         copy_stats = None
-        if error is None and len(predicted_grid) > 0 and len(expected_output) > 0:
+        if error is None and len(predicted_grid) > 0 and expected_output is not None and len(expected_output) > 0:
             copy_stats = self.compute_copy_stats(predicted_grid, input_grid, expected_output)
 
         result_dict = DiffusionResult(
             test_idx=test_idx,
             input_grid=input_grid.tolist(),
             predicted=predicted_grid.tolist() if len(predicted_grid) > 0 else None,
-            expected=expected_output.tolist() if len(expected_output) > 0 else [],
+            expected=expected_output.tolist() if expected_output is not None and len(expected_output) > 0 else [],
             correct=correct,
             error=error,
             pred_height=pred_height,
@@ -1343,7 +1375,7 @@ def print_metrics_report(metrics: Dict[str, Any], dataset: str, subset: str):
     total_test_examples = metrics["total_test_examples"]
 
     print(f"\n{'='*80}")
-    print(f"🎯 DIFFUSION MODEL EVALUATION RESULTS (PARTIAL CREDIT SCORING)")
+    print("🎯 DIFFUSION MODEL EVALUATION RESULTS (PARTIAL CREDIT SCORING)")
     print(f"📊 Dataset: {dataset}, Subset: {subset}")
     print(f"{'='*80}")
 
@@ -1352,7 +1384,7 @@ def print_metrics_report(metrics: Dict[str, Any], dataset: str, subset: str):
         return
 
     # Task-level metrics (partial credit with pass@2)
-    print(f"\n🎯 TASK-LEVEL METRICS (Pass@2 with Partial Credit):")
+    print("\n🎯 TASK-LEVEL METRICS (Pass@2 with Partial Credit):")
     print(f"  Total Tasks: {total_tasks}")
     print(f"  Task Pass@2 Score (Partial Credit): {metrics['avg_task_score']:.1%} - average pass@2 score across all tasks")
     print(f"  Task Pass@2 (Strict): {metrics['task_pass_at_2']}/{total_tasks} ({metrics['task_pass_at_2_rate']:.1%}) - tasks where ALL test examples passed")
@@ -1361,7 +1393,7 @@ def print_metrics_report(metrics: Dict[str, Any], dataset: str, subset: str):
     print(f"  Failed Tasks (0%): {metrics['failed_tasks']}/{total_tasks} ({metrics['failed_tasks']/total_tasks:.1%}) - no test examples passed")
 
     # Test example-level metrics
-    print(f"\n📊 TEST EXAMPLE-LEVEL METRICS:")
+    print("\n📊 TEST EXAMPLE-LEVEL METRICS:")
     print(f"  Total Test Examples: {total_test_examples} (avg {metrics['avg_test_examples_per_task']:.2f} per task)")
     print(f"  Pass@2 Rate: {metrics['test_pass_at_2']}/{total_test_examples} ({metrics['test_pass_at_2_rate']:.1%})")
     print(f"  Both Correct Rate: {metrics['test_both_correct']}/{total_test_examples} ({metrics['test_both_correct_rate']:.1%})")
@@ -1369,15 +1401,15 @@ def print_metrics_report(metrics: Dict[str, Any], dataset: str, subset: str):
     print(f"  Attempt 2 Accuracy: {metrics['test_attempt_2_correct']}/{total_test_examples} ({metrics['test_attempt_2_accuracy']:.1%})")
 
     # Size prediction accuracy
-    print(f"\n📏 SIZE PREDICTION ACCURACY:")
+    print("\n📏 SIZE PREDICTION ACCURACY:")
     print(f"  Correct Sizes: {metrics['size_correct']}/{metrics['size_total']} ({metrics['size_accuracy']:.1%})")
 
     # Per-task breakdown
-    print(f"\n📈 PER-TASK BREAKDOWN:")
+    print("\n📈 PER-TASK BREAKDOWN:")
     print(f"  Avg Test Examples Passed Per Task: {metrics['avg_test_examples_passed_per_task']:.2f} / {metrics['avg_test_examples_per_task']:.2f}")
 
     # Copy statistics
-    print(f"\n📋 COPY BEHAVIOR STATISTICS:")
+    print("\n📋 COPY BEHAVIOR STATISTICS:")
     print(f"  Copy Rate: {metrics['avg_copy_rate']:.1%}")
     print(f"  Edit Accuracy: {metrics['avg_edit_accuracy']:.1%} (accuracy on cells requiring transformation)")
     print(f"  Keep Accuracy: {metrics['avg_keep_accuracy']:.1%} (accuracy on cells to preserve)")
@@ -1386,10 +1418,10 @@ def print_metrics_report(metrics: Dict[str, Any], dataset: str, subset: str):
 
     # Interpret copy behavior
     if metrics['avg_keep_accuracy'] > metrics['avg_edit_accuracy'] + 0.1:
-        print(f"  ⚠️  Identity Attractor: Keep accuracy >> Edit accuracy")
+        print("  ⚠️  Identity Attractor: Keep accuracy >> Edit accuracy")
 
     # Trajectory statistics
-    print(f"\n🔄 SAMPLING TRAJECTORY STATISTICS:")
+    print("\n🔄 SAMPLING TRAJECTORY STATISTICS:")
     print(f"  Final Δ-change: {metrics['avg_final_delta']:.2%} (fraction of cells changed in last step)")
     print(f"  Final Confidence: {metrics['avg_final_confidence']:.1%}")
     print(f"  Early-lock Count: {metrics['early_lock_count']}/{total_test_examples} ({metrics['early_lock_count']/total_test_examples:.1%})")
@@ -1397,10 +1429,10 @@ def print_metrics_report(metrics: Dict[str, Any], dataset: str, subset: str):
         print(f"  Avg Early-lock Step: {metrics['avg_early_lock_step']:.1f}")
 
     if metrics['early_lock_count'] > total_test_examples * 0.5 and metrics['avg_copy_rate'] > 0.7:
-        print(f"  ⚠️  Input Gravity Confirmed: Early-lock + high copy rate")
+        print("  ⚠️  Input Gravity Confirmed: Early-lock + high copy rate")
 
     # Error analysis
-    print(f"\n📋 ERROR ANALYSIS:")
+    print("\n📋 ERROR ANALYSIS:")
     print(f"  Attempt 1 Errors: {metrics['test_attempt_1_errors']}/{total_test_examples} ({metrics['test_attempt_1_error_rate']:.1%})")
     print(f"  Attempt 2 Errors: {metrics['test_attempt_2_errors']}/{total_test_examples} ({metrics['test_attempt_2_error_rate']:.1%})")
 
@@ -1510,21 +1542,18 @@ def main():
     # Handle limit parameter (0 means no limit)
     limit = args.limit if args.limit > 0 else None
 
-    # Override device detection if specified
-    if args.device != "auto":
-        if args.device == "cpu":
-            torch.cuda.is_available = lambda: False
-        elif args.device == "cuda" and not torch.cuda.is_available():
-            print("⚠️ CUDA requested but not available, falling back to CPU")
+    # Warn if CUDA requested but unavailable
+    if args.device == "cuda" and not torch.cuda.is_available():
+        print("⚠️ CUDA requested but not available, falling back to CPU")
 
-    print(f"🚀 ARC Diffusion Model Inference")
+    print("🚀 ARC Diffusion Model Inference")
     print(f"📅 Started at: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"📁 Config: {args.config}")
     print(f"🎲 Dataset: {dataset}/{subset}")
     if limit:
         print(f"⚡ Task limit: {limit}")
     else:
-        print(f"⚡ Task limit: All tasks")
+        print("⚡ Task limit: All tasks")
 
     try:
         # Initialize inference (pass dataset for correct task indexing)
@@ -1609,7 +1638,7 @@ def main():
         filtered_tasks = [(task_id, task_data) for task_id, task_data in filtered_tasks_dict.items()]
 
         tasks = filtered_tasks
-        print(f"📊 Task Filtering Results:")
+        print("📊 Task Filtering Results:")
         print(f"  Total tasks loaded: {total_tasks}")
         print(f"  Tasks filtered out (grid > {inference.config['max_size']}): {filtered_count}")
         print(f"  Tasks remaining: {len(tasks)}")

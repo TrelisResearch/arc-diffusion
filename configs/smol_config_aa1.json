@@ -1,5 +1,5 @@
 {
-  "model_version": "smol-v8-simple-sc",
+  "model_version": "smol-v9-sep-inputs",
   "tag": "aa1",
   "model": {
     "vocab_size": 11,

@@ -71,6 +71,9 @@ class TransformerDenoiser(nn.Module):
         # Positional encoding
         self.pos_encoding = CoordinatePositionalEncoding(max_size, d_model)
 
+        # Stream/type embedding to distinguish conditioning vs. denoising tokens
+        self.stream_embedding = nn.Embedding(2, d_model)
+
         # Task embedding (for task conditioning)
         self.task_embedding = nn.Embedding(max_tasks, d_model)
 
@@ -142,13 +145,11 @@ class TransformerDenoiser(nn.Module):
         input_emb = self.embedding_dropout(input_emb)
         xt_emb = self.embedding_dropout(xt_emb)
 
-        masks_flat = None
-        if masks is not None:
-            masks_flat = masks.view(batch_size, -1, 1).float()
+        # Prepare masks if provided
+        masks_flat = masks.view(batch_size, -1, 1).float() if masks is not None else None
 
-        # Apply masking to embeddings if masks provided
         if masks_flat is not None:
-            xt_emb = xt_emb * masks_flat  # Zero out invalid regions
+            xt_emb = xt_emb * masks_flat  # Zero out invalid regions for noisy stream
 
         # Apply input grid conditioning dropout (training only)
         if self.training and self.input_grid_dropout > 0:
@@ -159,19 +160,21 @@ class TransformerDenoiser(nn.Module):
             # Apply dropout with scaling to maintain expectation
             input_emb = input_emb * dropout_mask / keep_prob
 
-        # Combine input and noisy embeddings element-wise
-        combined_emb = input_emb + xt_emb
-
-        # Add self-conditioning features if provided
+        # Build noisy stream (xt + optional self-conditioning)
+        noisy_stream = xt_emb
         if sc_state is not None:
             sc_state_flat = sc_state.view(batch_size, -1, self.d_model)
-
-            if masks_flat is None and masks is not None:
-                masks_flat = masks.view(batch_size, -1, 1).float()
             if masks_flat is not None:
                 sc_state_flat = sc_state_flat * masks_flat
+            noisy_stream = noisy_stream + sc_state_flat
 
-            combined_emb = combined_emb + sc_state_flat
+        # Add stream embeddings: 0=input conditioning, 1=noisy stream
+        seq_len = self.max_size * self.max_size
+        input_stream_ids = torch.zeros((batch_size, seq_len), dtype=torch.long, device=device)
+        noisy_stream_ids = torch.ones((batch_size, seq_len), dtype=torch.long, device=device)
+
+        input_stream = input_emb + self.stream_embedding(input_stream_ids)
+        noisy_stream = noisy_stream + self.stream_embedding(noisy_stream_ids)
 
         # Create separate conditioning tokens
         task_token = self.task_embedding(task_ids).unsqueeze(1)  # [batch_size, 1, d_model]
@@ -193,20 +196,23 @@ class TransformerDenoiser(nn.Module):
         d4_token = self.d4_embedding(d4_idx).unsqueeze(1)  # [batch_size, 1, d_model]
         color_shift_token = self.color_shift_embedding(color_shift).unsqueeze(1)  # [batch_size, 1, d_model]
 
-        # Concatenate in sequence dimension: [task, time, d4, color_shift, combined_grid]
+        # Concatenate in sequence dimension: [task, time, d4, color_shift, input_stream, noisy_stream]
         sequence = torch.cat([
             task_token,         # [batch_size, 1, d_model]
             time_token,         # [batch_size, 1, d_model]
             d4_token,           # [batch_size, 1, d_model]
             color_shift_token,  # [batch_size, 1, d_model]
-            combined_emb        # [batch_size, max_size^2, d_model]
-        ], dim=1)  # [batch_size, 4 + max_size^2, d_model]
+            input_stream,       # [batch_size, max_size^2, d_model]
+            noisy_stream        # [batch_size, max_size^2, d_model]
+        ], dim=1)  # [batch_size, 4 + 2*max_size^2, d_model]
 
         # Single transformer processes the entire sequence
-        output = self.transformer(sequence)  # [batch_size, 4 + max_size^2, d_model]
+        output = self.transformer(sequence)  # [batch_size, 4 + 2*max_size^2, d_model]
 
-        # Extract predictions for grid positions (skip task/time/d4/color_shift tokens)
-        output_preds = output[:, 4:, :]  # [batch_size, max_size^2, d_model]
+        # Extract predictions for noisy stream positions
+        cond_len = seq_len
+        noisy_start_idx = 4 + cond_len
+        output_preds = output[:, noisy_start_idx:, :]  # [batch_size, max_size^2, d_model]
 
         # Predict logits for each cell (only for colors 0-9)
         logits = self.output_head(output_preds)  # [batch_size, max_size^2, 10]
@@ -490,6 +496,11 @@ class ARCDiffusionModel(nn.Module):
         # Apply embedding dropout
         input_emb = self.denoiser.embedding_dropout(input_emb)
 
+        # Add stream embedding for conditioning tokens
+        seq_len = self.max_size * self.max_size
+        stream_ids = torch.zeros((batch_size, seq_len), dtype=torch.long, device=device)
+        input_emb = input_emb + self.denoiser.stream_embedding(stream_ids)
+
         # Create task embedding
         task_emb = self.denoiser.task_embedding(task_ids)  # [batch_size, d_model]
         task_token = task_emb.unsqueeze(1)  # [batch_size, 1, d_model]
@@ -554,4 +565,3 @@ class ARCDiffusionModel(nn.Module):
         predicted_widths = torch.argmax(width_logits, dim=-1) + 1
 
         return predicted_heights, predicted_widths
-

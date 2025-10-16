@@ -1,5 +1,5 @@
 {
-  "model_version": "smol-v8",
+  "model_version": "smol-v9",
   "tag": "aa2-lora-from-aa1",
   "pretrained_model_path": "outputs/aa1/final_model.pt",
   "model": {

@@ -1,5 +1,5 @@
 {
-  "model_version": "smol-v8-1M",
+  "model_version": "smol-v9-1M",
   "tag": "aa2",
   "model": {
     "vocab_size": 11,

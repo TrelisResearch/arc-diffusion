@@ -259,8 +259,12 @@ class DiffusionInference:
         )
 
         # Load weights (model_state_dict contains EMA weights if EMA was used during training)
-        model.load_state_dict(state_dict)
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
         print("✓ Loaded model weights from checkpoint")
+        if missing_keys:
+            print(f"  ⚠️ Missing checkpoint keys: {missing_keys}")
+        if unexpected_keys:
+            print(f"  ⚠️ Unexpected checkpoint keys: {unexpected_keys}")
 
         model.to(self.device)
         model.eval()

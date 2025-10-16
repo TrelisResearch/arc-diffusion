@@ -102,7 +102,11 @@ Examples:
     print(f"📅 Started at: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"📁 Config: {config_path}")
     print(f"📂 Output dir: {output_dir}")
-    print(f"⚡ Evaluation limit: {args.eval_limit}")
+    eval_limit = args.eval_limit
+    if eval_limit == 0 and config_path.stem == "test_config":
+        eval_limit = 10
+
+    print(f"⚡ Evaluation limit: {eval_limit if eval_limit > 0 else 'All'}")
 
     # Track which steps to run
     steps_to_run = []
@@ -158,19 +162,17 @@ Examples:
         eval_command = [
             "uv", "run", "python", "evaluate.py",
             "--config", str(config_path),
-            "--limit", str(args.eval_limit),
+            "--limit", str(eval_limit),
             "--maj",
             "--stats",
-            "--prefer-best"
         ]
 
-        # Add --prefer-best flag if specified
         if args.prefer_best:
             eval_command.append("--prefer-best")
 
         if not run_command(
             eval_command,
-            f"Model evaluation (limit: {args.eval_limit} tasks)",
+            f"Model evaluation (limit: {eval_limit} tasks)" if eval_limit > 0 else "Model evaluation (limit: all tasks)",
             cwd=str(project_root)
         ):
             print("❌ Evaluation failed")

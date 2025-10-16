@@ -1,6 +1,13 @@
 # Diffusion Notes
 
 ## Daily Notes
+### Oct 16th 2025
+#### Simplifying inputs and sc
+```bash
+nohup bash -c 'PYTHONUNBUFFERED=1 uv run pipeline.py --config configs/smol_config_aa1.json > smol-v8-sep-inputs.log 2>&1' &
+```
+separate inputs and noised outputs+sc
+
 ### Oct 15th 2025
 #### Simplifying inputs and sc
 ```bash

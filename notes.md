@@ -4,15 +4,16 @@
 ### Oct 16th 2025
 #### Simplifying inputs and sc
 ```bash
-nohup bash -c 'PYTHONUNBUFFERED=1 uv run pipeline.py --config configs/smol_config_aa1.json > smol-v8-sep-inputs.log 2>&1' &
+nohup bash -c 'PYTHONUNBUFFERED=1 uv run pipeline.py --config configs/smol_config_aa1.json > smol-v9-sep-inputs.log 2>&1' &
 ```
-separate inputs and noised outputs+sc
+separate inputs and noised outputs+sc to see if that helps, having that explicit attention.
 
 ### Oct 15th 2025
 #### Simplifying inputs and sc
 ```bash
 nohup bash -c 'PYTHONUNBUFFERED=1 uv run pipeline.py --config configs/smol_config_aa1.json > smol-v8-simple-sc.log 2>&1' &
 ```
+"avg_task_score": 0.16
 
 ### Oct 13th 2025
 #### Adding 10% noise to all input grids, across all cells (incl. black)

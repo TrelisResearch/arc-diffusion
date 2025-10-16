@@ -74,6 +74,9 @@ class TransformerDenoiser(nn.Module):
         # Stream/type embedding to distinguish conditioning vs. denoising tokens
         self.stream_embedding = nn.Embedding(2, d_model)
 
+        # Light projection for self-conditioning features
+        self.sc_proj = nn.Linear(d_model, d_model)
+
         # Task embedding (for task conditioning)
         self.task_embedding = nn.Embedding(max_tasks, d_model)
 
@@ -166,7 +169,8 @@ class TransformerDenoiser(nn.Module):
             sc_state_flat = sc_state.view(batch_size, -1, self.d_model)
             if masks_flat is not None:
                 sc_state_flat = sc_state_flat * masks_flat
-            noisy_stream = noisy_stream + sc_state_flat
+            sc_term = self.sc_proj(sc_state_flat)
+            noisy_stream = noisy_stream + sc_term
 
         # Add stream embeddings: 0=input conditioning, 1=noisy stream
         seq_len = self.max_size * self.max_size
